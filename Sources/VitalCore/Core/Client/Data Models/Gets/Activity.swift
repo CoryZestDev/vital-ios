@@ -8,6 +8,13 @@ public struct ActivityRawResponse: Equatable, Decodable {
   public var activity: [AnyDecodable]
 }
 
+public struct HeartRate: Equatable, Decodable { 
+  public var avg_bpm: Double?
+  public var min_bpm: Double?
+  public var max_bpm: Double? 
+  public var resting_bpm: Double?
+}
+
 public struct ActivitySummary: Equatable, Decodable {
   public var id: UUID
   public var calendarDate: String
@@ -19,6 +26,7 @@ public struct ActivitySummary: Equatable, Decodable {
   public var medium: Double?
   public var high: Double?
   public var source: Source
+  public var heart_rate: HeartRate?
   public var floorsClimbed: Int?
   public var timezoneOffset: Int?
 }
