@@ -1,24 +1,11 @@
 import Foundation
 
 //calories_active, calories_basal, distance, blood_oxygen, blood_pressure, body/fat, body/weight, cholesterol, cholesterol/ldl, cholesterol/hdl, cholesterol/total, cholesterol/triglycerides, floors_climbed, hrv, heartrate_variability, hypnogram, ige, igg, respiratory_rate, steps, stress_level, vo2_max, water, caffeine, mindfulness_minutes
-public enum ScalarTimeseriesResource {
-  case glucose
-  case heartRate
-  case vo2_max
-  case hrv
-  
-  var toPath: String {
-    switch self {
-      case .heartRate:
-        return "heartrate"
-      case .glucose:
-        return "glucose"
-      case .vo2_max:
-        return "vo2_max"
-    case .hrv:
-        return "hrv"
-    }
-  }
+public enum ScalarTimeseriesResource: String {
+  case glucose = "glucose"
+  case heartRate = "heartrate"
+  case vo2_max = "vo2_max"
+  case hrv = "hrv"
 }
 
 public extension VitalClient {
