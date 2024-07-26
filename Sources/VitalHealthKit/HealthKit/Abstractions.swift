@@ -7,9 +7,33 @@ struct RemappedVitalResource: Hashable {
 
 struct ReadOptions {
   var perDeviceActivityTS: Bool = false
+  var embedTimeseries: Bool = false
 
-  internal init(perDeviceActivityTS: Bool = false) {
+  internal init(perDeviceActivityTS: Bool = false, embedTimeseries: Bool = false) {
     self.perDeviceActivityTS = perDeviceActivityTS
+    self.embedTimeseries = embedTimeseries
+  }
+}
+
+struct Predicates: @unchecked Sendable {
+  let wrapped: [NSPredicate]
+
+  init(_ predicates: [NSPredicate]) {
+    self.wrapped = predicates
+  }
+
+  func withHeartRateZone(_ range: Range<Double>) -> Predicates {
+    let unit = HKUnit.count().unitDivided(by: .minute())
+    return Predicates(wrapped + [
+      HKQuery.predicateForQuantitySamples(
+        with: .greaterThanOrEqualTo,
+        quantity: HKQuantity(unit: unit, doubleValue: range.lowerBound)
+      ),
+      HKQuery.predicateForQuantitySamples(
+        with: .lessThan,
+        quantity: HKQuantity(unit: unit, doubleValue: range.upperBound)
+      ),
+    ])
   }
 }
 
@@ -23,7 +47,7 @@ struct VitalHealthKitStore {
   var toVitalResource: (HKSampleType) -> VitalResource
   
   var writeInput: (DataInput, Date, Date) async throws -> Void
-  var readResource: (RemappedVitalResource, Date, Date, VitalHealthKitStorage, ReadOptions) async throws -> (ProcessedResourceData?, [StoredAnchor])
+  var readResource: (RemappedVitalResource, SyncInstruction, VitalHealthKitStorage, ReadOptions) async throws -> (ProcessedResourceData?, [StoredAnchor])
 
   var enableBackgroundDelivery: (HKObjectType, HKUpdateFrequency, @escaping (Bool, Error?) -> Void) -> Void
   var disableBackgroundDelivery: () async -> Void
@@ -113,8 +137,44 @@ extension VitalHealthKitStore {
       case HKSampleType.categoryType(forIdentifier: .mindfulSession)!:
         return .vitals(.mindfulSession)
 
-      default:
-        fatalError("\(String(describing: type)) is not supported. This is a developer error")
+
+    case
+      HKCategoryType.categoryType(forIdentifier: .menstrualFlow)!,
+      HKCategoryType.categoryType(forIdentifier: .cervicalMucusQuality)!,
+      HKCategoryType.categoryType(forIdentifier: .intermenstrualBleeding)!,
+      HKCategoryType.categoryType(forIdentifier: .ovulationTestResult)!,
+      HKCategoryType.categoryType(forIdentifier: .sexualActivity)!,
+      HKQuantityType.quantityType(forIdentifier: .basalBodyTemperature)!:
+      return .menstrualCycle
+
+    default:
+      if #available(iOS 15.0, *) {
+        switch type {
+        case
+          HKCategoryType.categoryType(forIdentifier: .contraceptive)!,
+          HKCategoryType.categoryType(forIdentifier: .pregnancyTestResult)!,
+          HKCategoryType.categoryType(forIdentifier: .progesteroneTestResult)!:
+          return .menstrualCycle
+        default:
+          break
+        }
+      }
+
+
+      if #available(iOS 16.0, *) {
+        switch type {
+        case
+          HKCategoryType.categoryType(forIdentifier: .persistentIntermenstrualBleeding)!,
+          HKCategoryType.categoryType(forIdentifier: .prolongedMenstrualPeriods)!,
+          HKCategoryType.categoryType(forIdentifier: .irregularMenstrualCycles)!,
+          HKCategoryType.categoryType(forIdentifier: .infrequentMenstrualCycles)!:
+          return .menstrualCycle
+        default:
+          break
+        }
+      }
+
+      fatalError("\(String(describing: type)) is not supported. This is a developer error")
     }
   }
   
@@ -160,14 +220,13 @@ extension VitalHealthKitStore {
         startDate: startDate,
         endDate: endDate
       )
-    } readResource: { (resource, startDate, endDate, storage, options) in
+    } readResource: { (resource, instruction, storage, options) in
       try await read(
         resource: resource,
         healthKitStore: store,
         typeToResource: toVitalResource,
         vitalStorage: storage,
-        startDate: startDate,
-        endDate: endDate,
+        instruction: instruction,
         options: options
       )
     } enableBackgroundDelivery: { (type, frequency, completion) in
@@ -192,7 +251,7 @@ extension VitalHealthKitStore {
       return .sleep
     } writeInput: { (dataInput, startDate, endDate) in
       return
-    } readResource: { _,_,_,_, _  in
+    } readResource: { _,_,_, _  in
       return (ProcessedResourceData.timeSeries(.glucose([])), [])
     } enableBackgroundDelivery: { _, _, _ in
       return
@@ -207,28 +266,30 @@ extension VitalHealthKitStore {
 }
 
 struct VitalClientProtocol {
-  var post: (ProcessedResourceData, TaggedPayload.Stage, Provider.Slug, TimeZone) async throws -> Void
+  var post: (ProcessedResourceData, TaggedPayload.Stage, Provider.Slug, TimeZone, Bool) async throws -> Void
   var checkConnectedSource: (Provider.Slug) async throws -> Void
   var sdkStateSync: (UserSDKSyncStateBody) async throws -> UserSDKSyncStateResponse
 }
 
 extension VitalClientProtocol {
   static var live: VitalClientProtocol {
-    .init { data, stage, provider, timeZone in
+    .init { data, stage, provider, timeZone, isFinalChunk in
       switch data {
         case let .summary(summaryData):
           try await VitalClient.shared.summary.post(
             summaryData,
             stage: stage,
             provider: provider,
-            timeZone: timeZone
+            timeZone: timeZone,
+            isFinalChunk: isFinalChunk
           )
         case let .timeSeries(timeSeriesData):
           try await VitalClient.shared.timeSeries.post(
             timeSeriesData,
             stage: stage,
             provider: provider,
-            timeZone: timeZone
+            timeZone: timeZone,
+            isFinalChunk: isFinalChunk
           )
       }
     } checkConnectedSource: { provider in
@@ -241,7 +302,7 @@ extension VitalClientProtocol {
   }
   
   static var debug: VitalClientProtocol {
-    .init { _,_,_,_ in
+    .init { _,_,_,_,_ in
       return ()
     } checkConnectedSource: { _ in
       return
@@ -265,6 +326,8 @@ struct StatisticsQueryDependencies {
   /// and the resulting statistics use end-exclusive time intervals as well.
   var executeStatisticalQuery: (HKQuantityType, Range<Date>, Granularity, HKStatisticsOptions?) async throws -> [VitalStatistics]
 
+  var executeSingleStatisticsQuery: (HKQuantityType, Range<Date>, HKStatisticsOptions, Predicates) async throws -> HKStatistics?
+
   var isFirstTimeSycingType: (HKQuantityType) -> Bool
   var isLegacyType: (HKQuantityType) -> Bool
   
@@ -275,6 +338,8 @@ struct StatisticsQueryDependencies {
 
   static var debug: StatisticsQueryDependencies {
     return .init { _, _, _, _ in
+      fatalError()
+    } executeSingleStatisticsQuery: { _, _, _, _ in
       fatalError()
     } isFirstTimeSycingType: { _ in
       fatalError()
@@ -395,6 +460,55 @@ struct StatisticsQueryDependencies {
         }
 
         healthKitStore.execute(query)
+      }
+
+    } executeSingleStatisticsQuery: { type, date, options, predicates in
+
+      // %@ <= %K AND %K < %@
+      // Exclusive end as per Apple documentation
+      // https://developer.apple.com/documentation/healthkit/hkquery/1614771-predicateforsampleswithstartdate#discussion
+      let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+        HKQuery.predicateForSamples(
+          withStart: date.lowerBound,
+          end: date.upperBound,
+          options: [.strictStartDate, .strictEndDate]
+        )
+      ] + predicates.wrapped)
+
+      // If task is already cancelled, don't bother with starting the query.
+      try Task.checkCancellation()
+
+      return try await withCheckedThrowingContinuation { continuation in
+
+        healthKitStore.execute(
+          HKStatisticsQuery(
+            quantityType: type,
+            quantitySamplePredicate: predicate,
+            options: options
+          ) { _, statistics, error in
+            guard let statistics = statistics else {
+              guard let error = error else {
+                continuation.resume(
+                  throwing: VitalHealthKitClientError.healthKitInvalidState(
+                    "HKStatisticsCollectionQuery returns neither a result set nor an error."
+                  )
+                )
+                return
+              }
+
+              switch (error as? HKError)?.code {
+              case .errorNoData:
+                continuation.resume(with: .success(nil))
+              default:
+                continuation.resume(with: .failure(error))
+              }
+
+              return
+            }
+
+            continuation.resume(with: .success(statistics))
+          }
+        )
       }
 
     } isFirstTimeSycingType: { type in

@@ -51,6 +51,10 @@ public enum PermissionOutcome: Equatable {
 
   let configuration: ProtectedBox<Configuration>
 
+  let syncSerializerLock = NSLock()
+  var syncSerializer: [RemappedVitalResource: ParkingLot] = [:]
+
+
   private var isAutoSyncConfigured: Bool {
     backgroundDeliveryEnabled.value ?? false
   }
@@ -197,7 +201,7 @@ public extension VitalHealthKitClient {
       mode: DataPushMode = .automatic
     ) {
       self.backgroundDeliveryEnabled = backgroundDeliveryEnabled
-      self.numberOfDaysToBackFill = min(numberOfDaysToBackFill, 90)
+      self.numberOfDaysToBackFill = min(numberOfDaysToBackFill, 365)
       self.logsEnabled = logsEnabled
       self.mode = mode
     }
@@ -261,35 +265,7 @@ extension VitalHealthKitClient {
       (stream, streamContinuation) = backgroundObservers(for: uniqueFlatenned)
     }
 
-    let task = Task(priority: .high) {
-      /// Detect if we have ever had performed an initial sync.
-      /// If we never did, start a background task and runs the initial sync first.
-      /// This ensures that `syncData` is called on all VitalResources at least once.
-      ///
-      /// We would defer consuming `stream` until all the initial sync are completed.
-      let unflaggedResources = resources.filter { storage.readFlag(for: $0.wrapped) == false }
-
-      if unflaggedResources.isEmpty == false {
-        VitalLogger.healthKit.info("[historical-bgtask] Started for \(unflaggedResources)")
-
-        let osBackgroundTask = ProtectedBox<UIBackgroundTaskIdentifier>()
-        osBackgroundTask.start("vital-historical-stage", expiration: {})
-        defer {
-          osBackgroundTask.endIfNeeded()
-          VitalLogger.healthKit.info("[historical-bgtask] Ended")
-        }
-
-        try await withTaskCancellationHandler {
-
-          for resource in unflaggedResources {
-            try Task.checkCancellation()
-            await sync(resource)
-          }
-
-        } onCancel: { osBackgroundTask.endIfNeeded() }
-
-      }
-
+    let task = Task<Void, any Error>(priority: .high) { @MainActor in
       for await payload in stream {
         // If the task is cancelled, we would break the endless iteration and end the task.
         // Any buffered payload would not be processed, and is expected to be redelivered by
@@ -303,26 +279,29 @@ extension VitalHealthKitClient {
           continue
         }
 
-        // Task is not cancelled — we must call the HealthKit completion handler irrespective of
-        // the sync process outcome. This is to avoid triggering the "strike on 3rd missed delivery"
-        // rule of HealthKit background delivery.
-        //
-        // Since we have fairly frequent delivery anyway, each of which will implicit retry from
-        // where the last sync has left off, this unconfigurable exponential backoff retry
-        // behaviour adds little to no value in maintaining data freshness.
-        //
-        // (except for the task cancellation redelivery expectation stated above).
-        defer { payload.completion(.completed) }
+        // Allow multiple resource sync to run concurrently.
+        Task(priority: .high) {
+          // Task is not cancelled — we must call the HealthKit completion handler irrespective of
+          // the sync process outcome. This is to avoid triggering the "strike on 3rd missed delivery"
+          // rule of HealthKit background delivery.
+          //
+          // Since we have fairly frequent delivery anyway, each of which will implicit retry from
+          // where the last sync has left off, this unconfigurable exponential backoff retry
+          // behaviour adds little to no value in maintaining data freshness.
+          //
+          // (except for the task cancellation redelivery expectation stated above).
+          defer { payload.completion(.completed) }
 
-        VitalLogger.healthKit.info("[BackgroundDelivery] Dequeued payload for \(payload.sampleTypes)")
+          VitalLogger.healthKit.info("received: \(payload.sampleTypes.map(\.shortenedIdentifier))", source: "BgDelivery")
 
-        guard let first = payload.sampleTypes.first else {
-          continue
+          guard let first = payload.sampleTypes.first else {
+            return
+          }
+
+          /// This means we are trying to sync related samples, so let's convert it to a `VitalResource`
+          let resource = VitalHealthKitStore.remapResource(store.toVitalResource(first))
+          await sync(resource, foreground: payload.appState != .background)
         }
-
-        /// This means we are trying to sync related samples, so let's convert it to a `VitalResource`
-        let resource = VitalHealthKitStore.remapResource(store.toVitalResource(first))
-        await sync(resource)
       }
     }
 
@@ -338,11 +317,11 @@ extension VitalHealthKitClient {
       store.enableBackgroundDelivery(sampleType, .immediate) { success, failure in
         
         guard failure == nil && success else {
-          VitalLogger.healthKit.error("Failed to enable background delivery for type: \(sampleType.identifier). Did you enable \"Background Delivery\" in Capabilities?")
+          VitalLogger.healthKit.error("failed: \(sampleType.shortenedIdentifier); error = \(String(describing: failure))", source: "EnableBgDelivery")
           return
         }
         
-        VitalLogger.healthKit.info("Successfully enabled background delivery for type: \(sampleType.identifier)")
+        VitalLogger.healthKit.info("enabled: \(sampleType.shortenedIdentifier)", source: "EnableBgDelivery")
       }
     }
   }
@@ -373,13 +352,13 @@ extension VitalHealthKitClient {
           }
 
           guard error == nil else {
-            VitalLogger.healthKit.error("Failed to background deliver for \(String(describing: sampleTypes)) with \(String(describing: error)).")
+            VitalLogger.healthKit.error("observer errored for \(typesToObserve.map(\.shortenedIdentifier)); error = \(String(describing: error)).")
 
             ///  We need a better way to handle if a failure happens here.
             return
           }
 
-          VitalLogger.healthKit.info("[HealthKit] Notified changes in \(sampleTypes)")
+          VitalLogger.healthKit.info("notified: \(sampleTypes.map(\.shortenedIdentifier))", source: "HealthKit")
 
           // It appears that the iOS 15+ HKObserverQuery might pass us `HKSampleType`s that is
           // outside the conditions we specified via `descriptors`. Filter out any unsolicited types
@@ -389,15 +368,18 @@ extension VitalHealthKitClient {
           if filteredSampleTypes.isEmpty {
             handler()
           } else {
-            let payload = BackgroundDeliveryPayload(
-              sampleTypes: filteredSampleTypes,
-              completion: { completion in
-                if completion == .completed {
-                  handler()
-                }
-              }
-            )
-            continuation.yield(payload)
+            Task(priority: .userInitiated) { @MainActor in
+              let payload = BackgroundDeliveryPayload(
+                sampleTypes: filteredSampleTypes,
+                completion: { completion in
+                  if completion == .completed {
+                    handler()
+                  }
+                },
+                appState: UIApplication.shared.applicationState
+              )
+              continuation.yield(payload)
+            }
           }
         }
 
@@ -436,17 +418,20 @@ extension VitalHealthKitClient {
             return
           }
 
-          VitalLogger.healthKit.info("[HealthKit] Notified changes in \(sampleType)")
-          
-          let payload = BackgroundDeliveryPayload(
-            sampleTypes: Set([sampleType]),
-            completion: { completion in
-              if completion == .completed {
-                handler()
-              }
-            }
-          )
-          continuation.yield(payload)
+          VitalLogger.healthKit.info("notified: \(sampleType.shortenedIdentifier)", source: "HealthKit")
+
+          Task(priority: .userInitiated) { @MainActor in
+            let payload = BackgroundDeliveryPayload(
+              sampleTypes: Set([sampleType]),
+              completion: { completion in
+                if completion == .completed {
+                  handler()
+                }
+              },
+              appState: UIApplication.shared.applicationState
+            )
+            continuation.yield(payload)
+          }
         }
         
         queries.append(query)
@@ -474,7 +459,7 @@ extension VitalHealthKitClient {
       let remappedResources = Set(resources.map(VitalHealthKitStore.remapResource(_:)))
 
       for resource in remappedResources {
-        await sync(resource)
+        await sync(resource, foreground: true)
       }
       
       _status.send(.syncingCompleted)
@@ -541,13 +526,11 @@ extension VitalHealthKitClient {
     }
 
     let state = LocalSyncState(
-      // Historical start date is generally fixed once generated the first time, until signOut() reset.
-      //
-      // The only exception is if an ingestion start was set, in which case the most up-to-date
-      // ingestion start date takes precedence.
-      historicalStageAnchor: backendState.requestStartDate ?? previousState?.historicalStageAnchor ?? now,
+      historicalStageAnchor: previousState?.historicalStageAnchor ?? now,
       defaultDaysToBackfill: previousState?.defaultDaysToBackfill ?? configuration.numberOfDaysToBackFill,
+      teamDataPullPreferences: previousState?.teamDataPullPreferences ?? backendState.pullPreferences,
 
+      ingestionStart: backendState.ingestionStart ?? previousState?.ingestionStart ?? .distantPast,
       // The query upper bound (end date for historical & daily) is normally open-ended.
       // In other words, `ingestionEnd` is typically nil.
       //
@@ -555,10 +538,10 @@ extension VitalHealthKitClient {
       // ingestion end date dictates the query upper bound.
       ingestionEnd: backendState.requestEndDate,
 
-      perDeviceActivityTS: backendState.perDeviceActivityTS,
+      perDeviceActivityTS: backendState.perDeviceActivityTs ?? false,
 
       // When we should revalidate the LocalSyncState again.
-      expiresAt: Date().addingTimeInterval(Double(backendState.expiresIn))
+      expiresAt: Date().addingTimeInterval(Double(backendState.expiresIn ?? 14400))
     )
 
     try storage.setLocalSyncState(state)
@@ -581,13 +564,71 @@ extension VitalHealthKitClient {
     return (instruction, state)
   }
 
-  private func sync(_ remappedResource: RemappedVitalResource) async {
-    guard self.pauseSynchronization == false else { return }
-
+  private func sync(_ remappedResource: RemappedVitalResource, foreground: Bool) async {
     let resource = remappedResource.wrapped
+    let description = resource.resourceToBackfillType().rawValue
 
-    let configuration = await configuration.get()
-    let description = resource.logDescription
+    guard self.pauseSynchronization == false else {
+      VitalLogger.healthKit.info("[\(description)] skipped (sync paused)", source: "Sync")
+      return
+    }
+
+    let parkingLot = self.syncSerializerLock.withLock {
+      if let parkingLot = self.syncSerializer[remappedResource] {
+        return parkingLot
+      }
+
+      let newLot = ParkingLot()
+      self.syncSerializer[remappedResource] = newLot
+      return newLot
+    }
+
+    // Use ParkingLot to ensure that — for each `RemappedVitalResource` — there can only be one
+    // `sync()` call actually carrying out the sync work.
+    //
+    // All other subsequent callers would just wait in the ParkingLot until the sync work is done.
+    //
+    // This defends the SDK against flood of HKObserverQuery callouts, presumably caused by some
+    // apps saving each HKSample individually, rather than in batches.
+    // (e.g., Oura as at July 2024)
+    guard parkingLot.tryTo(.enable) else {
+      VitalLogger.healthKit.info("[\(description)] +1 parked; fg=\(foreground)", source: "Sync")
+
+      // Throw CancellationError, which we can gracefully ignore.
+      try? await parkingLot.parkIfNeeded()
+
+      VitalLogger.healthKit.info("[\(description)] -1 parked; fg=\(foreground)", source: "Sync")
+      return
+    }
+    defer { _ = parkingLot.tryTo(.disable) }
+
+    VitalLogger.healthKit.info("[\(description)] begin fg=\(foreground)", source: "Sync")
+
+    guard let configuration = configuration.value else {
+      VitalLogger.healthKit.info("[\(description)] configuration unavailable", source: "Sync")
+      return
+    }
+
+    // If we receive this payload in foreground, wrap the sync work in
+    // a UIKit background task, in case the user will move the app to background soon.
+
+    let osBackgroundTask: ProtectedBox<UIBackgroundTaskIdentifier>?
+
+    if foreground {
+      osBackgroundTask = ProtectedBox<UIBackgroundTaskIdentifier>()
+      osBackgroundTask!.start("vital-sync-\(description)", expiration: {})
+      VitalLogger.healthKit.info("started: daily:\(description)", source: "UIKitBgTask")
+
+    } else {
+      osBackgroundTask = nil
+    }
+
+    defer {
+      if let osBackgroundTask = osBackgroundTask {
+        osBackgroundTask.endIfNeeded()
+        VitalLogger.healthKit.info("ended: daily:\(description)", source: "UIKitBgTask")
+      }
+    }
 
     do {
       let (instruction, state) = try await computeSyncInstruction(remappedResource.wrapped)
@@ -596,65 +637,67 @@ extension VitalHealthKitClient {
 
       // Signal syncing (so the consumer can convey it to the user)
       _status.send(.syncing(resource))
-      
-      // Fetch from HealthKit
-      let (data, entitiesToStore): (ProcessedResourceData?, [StoredAnchor])
-      
-      (data, entitiesToStore) = try await store.readResource(
-        remappedResource,
-        instruction.query.lowerBound,
-        instruction.query.upperBound,
-        storage,
-        ReadOptions(perDeviceActivityTS: state.perDeviceActivityTS)
-      )
 
-      guard let data = data, data.shouldSkipPost == false else {
-        /// If there's no data, independently of the stage, we won't send it.
-        /// Currently the server is returning 4XX when sending an empty payload.
-        /// More context on VIT-2232.
+      var hasMore = false
 
-        // TODO: We should post something anyway so that backend can emit a historical event.
+      repeat {
+        // Fetch from HealthKit
+        let (data, anchors): (ProcessedResourceData?, [StoredAnchor])
 
-        /// If it's historical, we store the entity and bailout
-        if instruction.stage != .daily {
-          storage.storeFlag(for: resource)
-          entitiesToStore.forEach(storage.store(entity:))
+        (data, anchors) = try await store.readResource(
+          remappedResource,
+          instruction,
+          storage,
+          ReadOptions(perDeviceActivityTS: state.perDeviceActivityTS)
+        )
+
+        // Continue the loop if any anchor reports hasMore=true.
+        hasMore = anchors.contains(where: \.hasMore)
+
+        // We skip empty POST only in daily stage.
+        // Empty POST is sent for historical stage, so we would consistently emit
+        // historical.data.*.created events.
+        guard
+          let data = data,
+          instruction.stage == .historical || data.shouldSkipPost == false
+        else {
+
+          VitalLogger.healthKit.info("[\(description)] no data to upload", source: "Sync")
+          _status.send(.nothingToSync(resource))
+
+          return
         }
 
-        VitalLogger.healthKit.info("[\(description)] no data to upload", source: "Sync")
-        _status.send(.nothingToSync(resource))
+        if configuration.mode.isAutomatic {
+          VitalLogger.healthKit.info("[\(description)] begin upload: \(instruction.stage)\(data.shouldSkipPost ? ",empty" : "")", source: "Sync")
 
-        return
-      }
+          // Post data
+          try await vitalClient.post(
+            data,
+            instruction.taggedPayloadStage,
+            .appleHealthKit,
+            /// We can't use `vitalCalendar` here. We want to send the user's timezone
+            /// rather than UTC (which is what `vitalCalendar` is set to).
+            TimeZone.current,
+            // Is final chunk?
+            hasMore == false
+          )
+        } else {
+          VitalLogger.healthKit.info("[\(description)] upload skipped in manual mode", source: "Sync")
+        }
 
-      if configuration.mode.isAutomatic {
-        VitalLogger.healthKit.info("[\(description)] begin upload", source: "Sync")
+        // This is used for calculating the stage (daily vs historical)
+        storage.storeFlag(for: resource)
 
-        let transformedData = transform(data: data, calendar: vitalCalendar)
+        // Save the anchor/date on a succesfull network call
+        anchors.forEach(storage.store(entity:))
 
-        // Post data
-        try await vitalClient.post(
-          transformedData,
-          instruction.taggedPayloadStage,
-          .appleHealthKit,
-          /// We can't use `vitalCalendar` here. We want to send the user's timezone
-          /// rather than UTC (which is what `vitalCalendar` is set to).
-          TimeZone.current
-        )
-      } else {
-        VitalLogger.healthKit.info("[\(description)] upload skipped in manual mode", source: "Sync")
-      }
-      
-      // This is used for calculating the stage (daily vs historical)
-      storage.storeFlag(for: resource)
-      
-      // Save the anchor/date on a succesfull network call
-      entitiesToStore.forEach(storage.store(entity:))
-      
-      VitalLogger.healthKit.info("[\(description)] completed", source: "Sync")
+        // Signal success
+        _status.send(.successSyncing(resource, data))
 
-      // Signal success
-      _status.send(.successSyncing(resource, data))
+        VitalLogger.healthKit.info("[\(description)] completed: \(hasMore ? "hasMore" : "noMore")", source: "Sync")
+
+      } while hasMore
 
     } catch let error {
       VitalLogger.healthKit.info("[\(description)] failed; error = \(error)", source: "Sync")
@@ -727,16 +770,11 @@ extension VitalHealthKitClient {
       healthKitStore:  HKHealthStore(),
       typeToResource: VitalHealthKitStore.live.toVitalResource,
       vitalStorage: VitalHealthKitStorage(storage: .debug),
-      startDate: startDate,
-      endDate: endDate,
-      options: ReadOptions()
+      instruction: SyncInstruction(stage: .daily, query: startDate ..< endDate),
+      options: ReadOptions(embedTimeseries: true)
     )
 
-    if let data = data {
-      return transform(data: data, calendar: vitalCalendar)
-    }
-
-    return nil
+    return data
   }
 }
 
@@ -766,63 +804,6 @@ extension VitalHealthKitClient {
         self.syncData()
       }
     }
-  }
-}
-
-func transform(data: ProcessedResourceData, calendar: Calendar) -> ProcessedResourceData {
-  switch data {
-    case .summary(.activity):
-      return data
-
-    case let .summary(.workout(patch)):
-      let workouts = patch.workouts.map { workout in
-        WorkoutPatch.Workout(
-          id: workout.id,
-          startDate: workout.startDate,
-          endDate: workout.endDate,
-          movingTime: workout.movingTime,
-          sourceBundle: workout.sourceBundle,
-          productType: workout.productType,
-          sport: workout.sport,
-          calories: workout.calories,
-          distance: workout.distance,
-          ascentElevation: workout.ascentElevation,
-          descentElevation: workout.descentElevation,
-          heartRate: average(workout.heartRate, calendar: calendar),
-          respiratoryRate: average(workout.respiratoryRate, calendar: calendar)
-        )
-      }
-      
-      return .summary(.workout(WorkoutPatch(workouts: workouts)))
-
-    case let.summary(.sleep(patch)):
-      let sleep = patch.sleep.map { sleep in
-        SleepPatch.Sleep(
-          id: sleep.id,
-          startDate: sleep.startDate,
-          endDate: sleep.endDate,
-          sourceBundle: sleep.sourceBundle,
-          productType: sleep.productType,
-          heartRate: average(sleep.heartRate, calendar: calendar),
-          restingHeartRate: average(sleep.restingHeartRate, calendar: calendar),
-          heartRateVariability: average(sleep.heartRateVariability, calendar: calendar),
-          oxygenSaturation: average(sleep.oxygenSaturation, calendar: calendar),
-          respiratoryRate: average(sleep.respiratoryRate, calendar: calendar),
-          sleepStages: sleep.sleepStages
-        )
-      }
-
-      return .summary(.sleep(SleepPatch(sleep: sleep)))
-      
-    case .summary(.body), .summary(.profile):
-      return data
-      
-    case let .timeSeries(.heartRate(samples)):
-      let newSamples = average(samples, calendar: calendar)
-      return .timeSeries(.heartRate(newSamples))
-      
-    case .timeSeries:
-      return data
   }
 }
 

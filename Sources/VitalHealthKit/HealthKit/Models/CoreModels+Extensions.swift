@@ -271,7 +271,12 @@ extension HKSampleType {
 
       case HKQuantityType.quantityType(forIdentifier: .appleExerciseTime)!:
         return "min"
-        
+
+    case
+      HKSampleType.quantityType(forIdentifier: .bodyTemperature)!,
+      HKSampleType.quantityType(forIdentifier: .basalBodyTemperature)!:
+      return "\u{00B0}C"
+
       default:
         fatalError("\(String(describing: self)) type not supported)")
     }
@@ -341,6 +346,11 @@ extension HKSampleType {
       case
         HKSampleType.quantityType(forIdentifier: .appleExerciseTime)!:
         return .minute()
+
+    case
+      HKSampleType.quantityType(forIdentifier: .bodyTemperature)!,
+      HKSampleType.quantityType(forIdentifier: .basalBodyTemperature)!:
+      return .degreeCelsius()
 
       default:
         fatalError("\(String(describing: self)) type not supported)")
@@ -465,11 +475,7 @@ public extension SleepPatch.Sleep {
 }
 
 extension WorkoutPatch.Workout {
-  public init?(sample: HKSample) {
-    guard let workout = sample as? HKWorkout else {
-      return nil
-    }
-
+  public init(_ workout: HKWorkout) {
     var ascentElevation: Double? = nil
     if let ascentElevationQuantity = workout.metadata?[HKMetadataKeyElevationAscended] as? HKQuantity {
       ascentElevation = ascentElevationQuantity.doubleValue(for: .meter())
@@ -482,8 +488,8 @@ extension WorkoutPatch.Workout {
 
     self.init(
       id: workout.uuid,
-      startDate: sample.startDate,
-      endDate: sample.endDate,
+      startDate: workout.startDate,
+      endDate: workout.endDate,
       movingTime: workout.duration,
       sourceBundle: workout.sourceRevision.source.bundleIdentifier,
       productType: workout.sourceRevision.productType,

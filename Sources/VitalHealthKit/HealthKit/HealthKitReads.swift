@@ -1,5 +1,6 @@
 import HealthKit
 import VitalCore
+import Accelerate
 
 typealias SampleQueryHandler = (HKSampleQuery, [HKSample]?, Error?) -> Void
 typealias AnchorQueryHandler = (HKAnchoredObjectQuery, [HKSample]?, [HKDeletedObject]?, HKQueryAnchor?, Error?) -> Void
@@ -15,6 +16,15 @@ enum VitalHealthKitClientError: Error {
   case invalidInterval(Date, Date, context: StaticString)
   case invalidRemappedResource
   case connectionPaused
+  case healthKitInvalidState(String)
+}
+
+enum AnchoredQueryChunkSize {
+  static let timeseries = 50000
+  static let workout = 40
+  // IMPORTANT: The current Sleep Session stitching algorithm is not chunkable.
+  static let sleep = HKObjectQueryNoLimit
+  static let activityTimeseries = 50000
 }
 
 struct VitalStatisticsError: Error {
@@ -33,8 +43,7 @@ func read(
   healthKitStore: HKHealthStore,
   typeToResource: ((HKSampleType) -> VitalResource),
   vitalStorage: VitalHealthKitStorage,
-  startDate: Date,
-  endDate: Date,
+  instruction: SyncInstruction,
   options: ReadOptions
 ) async throws -> (ProcessedResourceData?, [StoredAnchor]) {
   
@@ -58,8 +67,8 @@ func read(
       let payload = try await handleBody(
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
       
       return (.summary(.body(payload.bodyPatch)), payload.anchors)
@@ -68,8 +77,9 @@ func read(
       let payload = try await handleSleep(
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound,
+        options: options
       )
       
       return (.summary(.sleep(payload.sleepPatch)), payload.anchors)
@@ -78,19 +88,27 @@ func read(
       let payload = try await handleActivity(
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate,
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound,
         options: options
       )
       
       return (payload.activityPatch.map { .summary(.activity($0)) }, payload.anchors)
-      
+
+  case .menstrualCycle:
+    let payload = try await handleMenstrualCycle(healthKitStore: healthKitStore, vitalStorage: vitalStorage, instruction: instruction)
+    return (
+      .summary(.menstrualCycle(MenstrualCyclePatch(cycles: payload.menstrualCycles))),
+      payload.anchors
+    )
+
     case .workout:
       let payload = try await handleWorkouts(
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound,
+        options: options
       )
       
       return (.summary(.workout(payload.workoutPatch)), payload.anchors)
@@ -100,8 +118,8 @@ func read(
         type: .quantityType(forIdentifier: .oxygenSaturation)!,
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
 
       return (.timeSeries(.bloodOxygen(payload.samples)), payload.anchors)
@@ -111,8 +129,8 @@ func read(
         type: .quantityType(forIdentifier: .bloodGlucose)!,
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
       
       return (.timeSeries(.glucose(payload.samples)), payload.anchors)
@@ -122,8 +140,8 @@ func read(
         type: .quantityType(forIdentifier: .heartRate)!,
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
       
       return (.timeSeries(.heartRate(payload.samples)), payload.anchors)
@@ -133,8 +151,8 @@ func read(
         type: .quantityType(forIdentifier: .heartRateVariabilitySDNN)!,
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
 
       return (.timeSeries(.heartRateVariability(payload.samples)), payload.anchors)
@@ -143,8 +161,8 @@ func read(
       let payload = try await handleBloodPressure(
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
       
       return (.timeSeries(.bloodPressure(payload.bloodPressure)), payload.anchors)
@@ -154,8 +172,8 @@ func read(
         type: .quantityType(forIdentifier: .dietaryWater)!,
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
       
       return (.timeSeries(.nutrition(.water(payload.samples))), payload.anchors)
@@ -165,8 +183,8 @@ func read(
         type: .quantityType(forIdentifier: .dietaryCaffeine)!,
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
 
       return (.timeSeries(.nutrition(.caffeine(payload.samples))), payload.anchors)
@@ -175,8 +193,8 @@ func read(
       let payload = try await handleMindfulSessions(
         healthKitStore: healthKitStore,
         vitalStorage: vitalStorage,
-        startDate: startDate,
-        endDate: endDate
+        startDate: instruction.query.lowerBound,
+        endDate: instruction.query.upperBound
       )
 
       return (.timeSeries(.mindfulSession(payload.samples)), payload.anchors)
@@ -192,10 +210,11 @@ func handleMindfulSessions(
 
   var anchors: [StoredAnchor] = []
 
-  let payload = try await query(
+  let payload = try await anchoredQuery(
     healthKitStore: healthKitStore,
     vitalStorage: vitalStorage,
     type: .categoryType(forIdentifier: .mindfulSession)!,
+    limit: AnchoredQueryChunkSize.timeseries,
     startDate: startDate,
     endDate: endDate
   )
@@ -260,10 +279,11 @@ func handleBody(
     type: HKSampleType
   ) async throws -> (quantities: [LocalQuantitySample], StoredAnchor?) {
     
-    let payload = try await query(
+    let payload = try await anchoredQuery(
       healthKitStore: healthKitStore,
       vitalStorage: vitalStorage,
       type: type,
+      limit: AnchoredQueryChunkSize.timeseries,
       startDate: startDate,
       endDate: endDate
     )
@@ -299,7 +319,8 @@ func handleSleep(
   healthKitStore: HKHealthStore,
   vitalStorage: VitalHealthKitStorage,
   startDate: Date,
-  endDate: Date
+  endDate: Date,
+  options: ReadOptions
 ) async throws -> (sleepPatch: SleepPatch, anchors: [StoredAnchor]) {
   
   var anchors: [StoredAnchor] = []
@@ -310,10 +331,11 @@ func handleSleep(
     predicate = HKCategoryValueSleepAnalysis.predicateForSamples(equalTo: [.asleepUnspecified, .asleepCore, .asleepREM, .asleepDeep, .awake, .inBed])
   }
   
-  let payload = try await query(
+  let payload = try await anchoredQuery(
     healthKitStore: healthKitStore,
     vitalStorage: vitalStorage,
     type: sleepType,
+    limit: AnchoredQueryChunkSize.sleep,
     startDate: startDate,
     endDate: endDate,
     extraPredicate: predicate
@@ -342,6 +364,8 @@ func handleSleep(
   var copies: [SleepPatch.Sleep] = []
 
   for (groupKey, sampleGroup) in samplesBySourceBundle {
+    let sourceRevision = sampleGroup[0].sourceRevision
+
     /// Sorting by start date is essential here, since HKAnchoredObjectQuery returns samples in insertion order.
     /// There is otherwise no guarantee of samples being somewhat chornologically ordered, and being so are important to
     /// achieve consistent and quality stitches across all sorts of HealthKit writers.
@@ -400,51 +424,40 @@ func handleSleep(
         fitSamples(sleep: &sleep)
       }
 
-      let originalHR: [HKSample] = try await querySample(
-        healthKitStore: healthKitStore,
-        type: .quantityType(forIdentifier: .heartRate)!,
-        startDate: sleep.startDate,
-        endDate: sleep.endDate
-      )
+      var heartRate: [LocalQuantitySample] = []
+      var hearRateVariability: [LocalQuantitySample] = []
+      var respiratoryRate: [LocalQuantitySample] = []
 
-      let filteredHR = originalHR.filter(by: sleep.sourceBundle)
-      let heartRate = filteredHR.compactMap(LocalQuantitySample.init)
+      let fromSameSourceRevision = NSPredicate(format: "%K == %@", HKPredicateKeyPathSourceRevision, sourceRevision)
 
-      let hearRateVariability: [LocalQuantitySample] = try await querySample(
-        healthKitStore: healthKitStore,
-        type: .quantityType(forIdentifier: .heartRateVariabilitySDNN)!,
-        startDate: sleep.startDate,
-        endDate: sleep.endDate
-      )
-        .filter(by: sleep.sourceBundle)
-        .compactMap(LocalQuantitySample.init)
+      if options.embedTimeseries {
+        heartRate = try await querySample(
+          healthKitStore: healthKitStore,
+          type: .quantityType(forIdentifier: .heartRate)!,
+          startDate: sleep.startDate,
+          endDate: sleep.endDate,
+          extraPredicates: [fromSameSourceRevision]
+        )
+          .compactMap(LocalQuantitySample.init)
 
-      let oxygenSaturation: [LocalQuantitySample] = try await querySample(
-        healthKitStore: healthKitStore,
-        type: .quantityType(forIdentifier: .oxygenSaturation)!,
-        startDate: sleep.startDate,
-        endDate: sleep.endDate
-      )
-        .filter(by: sleep.sourceBundle)
-        .compactMap(LocalQuantitySample.init)
+        hearRateVariability = try await querySample(
+          healthKitStore: healthKitStore,
+          type: .quantityType(forIdentifier: .heartRateVariabilitySDNN)!,
+          startDate: sleep.startDate,
+          endDate: sleep.endDate,
+          extraPredicates: [fromSameSourceRevision]
+        )
+          .compactMap(LocalQuantitySample.init)
 
-      let restingHeartRate: [LocalQuantitySample] = try await querySample(
-        healthKitStore: healthKitStore,
-        type: .quantityType(forIdentifier: .restingHeartRate)!,
-        startDate: sleep.startDate,
-        endDate: sleep.endDate
-      )
-        .filter(by: sleep.sourceBundle)
-        .compactMap(LocalQuantitySample.init)
-
-      let respiratoryRate: [LocalQuantitySample] = try await querySample(
-        healthKitStore: healthKitStore,
-        type: .quantityType(forIdentifier: .respiratoryRate)!,
-        startDate: sleep.startDate,
-        endDate: sleep.endDate
-      )
-        .filter(by: sleep.sourceBundle)
-        .compactMap(LocalQuantitySample.init)
+        respiratoryRate = try await querySample(
+          healthKitStore: healthKitStore,
+          type: .quantityType(forIdentifier: .respiratoryRate)!,
+          startDate: sleep.startDate,
+          endDate: sleep.endDate,
+          extraPredicates: [fromSameSourceRevision]
+        )
+          .compactMap(LocalQuantitySample.init)
+      }
 
       let wristTemperature: [LocalQuantitySample]
 
@@ -454,6 +467,7 @@ func handleSleep(
           type: .quantityType(forIdentifier: .appleSleepingWristTemperature)!,
           startDate: sleep.startDate,
           endDate: sleep.endDate,
+          extraPredicates: [fromSameSourceRevision],
           // `appleSleepingWristTemperature` sometimes falls outside the bounds of a sleep
           // This means that if we use `strictStartDate` we won't pick up these values.
           options: []
@@ -464,11 +478,37 @@ func handleSleep(
         wristTemperature = []
       }
 
+      let stats = StatisticsQueryDependencies.live(healthKitStore: healthKitStore, vitalStorage: vitalStorage)
+      let queryInterval = sleep.startDate ..< sleep.endDate
+      let predicates = Predicates([fromSameSourceRevision])
+
+      async let _heartRateStatistics = try stats.executeSingleStatisticsQuery(
+        HKQuantityType.quantityType(forIdentifier: .heartRate)!,
+        queryInterval,
+        [.discreteMin, .discreteMax, .discreteAverage],
+        predicates
+      )
+
+      async let _hrvStatistics = try await stats.executeSingleStatisticsQuery(
+        HKQuantityType.quantityType(forIdentifier: .heartRateVariabilitySDNN)!,
+        queryInterval,
+        [.discreteAverage],
+        predicates
+      )
+
       var copy = sleep
+
+      let heartRateStatistics = try await _heartRateStatistics
+      let heartRateUnit = HKUnit.count().unitDivided(by: .minute())
+      copy.heartRateMean = (heartRateStatistics?.averageQuantity()?.doubleValue(for: heartRateUnit)).map(Int.init)
+      copy.heartRateMinimum = (heartRateStatistics?.minimumQuantity()?.doubleValue(for: heartRateUnit)).map(Int.init)
+      copy.heartRateMaximum = (heartRateStatistics?.maximumQuantity()?.doubleValue(for: heartRateUnit)).map(Int.init)
+
+      let hrvStatistics = try await _hrvStatistics
+      copy.hrvMeanSdnn = hrvStatistics?.averageQuantity()?.doubleValue(for: .secondUnit(with: .milli))
+
       copy.heartRate = heartRate
       copy.heartRateVariability = hearRateVariability
-      copy.restingHeartRate = restingHeartRate
-      copy.oxygenSaturation = oxygenSaturation
       copy.respiratoryRate = respiratoryRate
       copy.wristTemperature = wristTemperature
 
@@ -521,10 +561,11 @@ func handleActivity(
       discoveryStartDate = startDate
     }
 
-    let payload = try await query(
+    let payload = try await anchoredQuery(
       healthKitStore: healthKitStore,
       vitalStorage: vitalStorage,
       type: type,
+      limit: AnchoredQueryChunkSize.activityTimeseries,
       startDate: discoveryStartDate,
       endDate: endDate
     )
@@ -625,13 +666,21 @@ func handleActivity(
     hourlyDistanceWalkingRunning.first?.startDate,
   ].compactMap { $0 }.min()
 
+  let daySummaryEndDate: Date? = [
+    hourlyActiveEnergyBurned.first?.endDate,
+    hourlyBasalEnergyBurned.first?.endDate,
+    hourlyStepCount.first?.endDate,
+    hourlyFlightsClimbed.first?.endDate,
+    hourlyDistanceWalkingRunning.first?.endDate,
+  ].compactMap { $0 }.max()
+
   let daySummaries: [GregorianCalendar.FloatingDate: ActivityPatch.DaySummary]
 
   if let startDate = daySummaryStartDate {
     daySummaries = try await queryActivityDaySummaries(
       dependencies: dependencies,
       startTime: daySummaryStartDate ?? startDate,
-      endTime: endDate,
+      endTime: daySummaryEndDate ?? endDate,
       in: deviceTimeZoneCalendar
     )
   } else {
@@ -664,53 +713,153 @@ func handleWorkouts(
   healthKitStore: HKHealthStore,
   vitalStorage: VitalHealthKitStorage,
   startDate: Date,
-  endDate: Date
+  endDate: Date,
+  options: ReadOptions
 ) async throws -> (workoutPatch: WorkoutPatch, anchors: [StoredAnchor]) {
   
   var anchors: [StoredAnchor] = []
   
-  let payload = try await query(
+  let payload = try await anchoredQuery(
     healthKitStore: healthKitStore,
     vitalStorage: vitalStorage,
     type: .workoutType(),
+    limit: AnchoredQueryChunkSize.workout,
     startDate: startDate,
     endDate: endDate
   )
   
-  let workouts = payload.sample.compactMap(WorkoutPatch.Workout.init)
   anchors.appendOptional(payload.anchor)
-  
+
+  let knownAge: Int?
+  do {
+    let dateOfBirth = try healthKitStore.patched_dateOfBirthComponents()
+    knownAge = dateOfBirth.flatMap { dob in
+      vitalCalendar.dateComponents(
+        [.year],
+        from: dob,
+        to: vitalCalendar.dateComponents(in: .current, from: Date())
+      ).year
+    }
+  } catch _ {
+    knownAge = nil
+  }
+  let zoneMaxHr = Double(220 - (knownAge ?? 30))
+
   var copies: [WorkoutPatch.Workout] = []
-  
-  for workout in workouts {
-    let heartRate: [LocalQuantitySample] = try await querySample(
-      healthKitStore: healthKitStore,
-      type: .quantityType(forIdentifier: .heartRate)!,
-      startDate: workout.startDate,
-      endDate: workout.endDate
-    )
-      .filter(by: workout.sourceBundle)
+
+  for workout in payload.sample {
+
+    let workout = workout as! HKWorkout
+    var patch = WorkoutPatch.Workout(workout)
+
+    let fromSameSourceRevision = [NSPredicate(format: "%K == %@", HKPredicateKeyPathSourceRevision, workout.sourceRevision)]
+    let fromSameDevice = workout.device.map { [NSPredicate(format: "%K == %@", HKPredicateKeyPathDevice, $0)] } ?? []
+
+    let queryInterval = workout.startDate ..< workout.endDate
+    let predicates = Predicates([
+      // sample has same HKSourceRevision **OR** sample has same HKDevice
+      NSCompoundPredicate(orPredicateWithSubpredicates: fromSameSourceRevision + fromSameDevice)
+    ])
+
+    func computeStatistics(_ patch: inout WorkoutPatch.Workout) async throws {
+      let samples = try await querySingle(
+        healthKitStore,
+        type: .quantityType(forIdentifier: .heartRate)!,
+        startDate: queryInterval.lowerBound,
+        endDate: queryInterval.upperBound,
+        extraPredicates: predicates
+      )
+
+      guard samples.count >= 2 else {
+        return
+      }
+
+      let unit = HKUnit.count().unitDivided(by: .minute())
+      let timestamps = samples.map { $0.startDate.timeIntervalSinceReferenceDate }
+      let durations = vDSP.subtract(timestamps.dropFirst(), timestamps.dropLast())
+      let values = samples.map { unsafeDowncast($0, to: HKQuantitySample.self).quantity.doubleValue(for: unit) }.dropLast()
+      precondition(durations.count == values.count)
+
+      let zone1Range = 0.0 ..< zoneMaxHr * 0.5
+      let zone2Range = 0.5 ..< zoneMaxHr * 0.6
+      let zone3Range = 0.6 ..< zoneMaxHr * 0.7
+      let zone4Range = 0.7 ..< zoneMaxHr * 0.8
+      let zone5Range = 0.8 ..< zoneMaxHr * 0.9
+      let zone6Range = 0.9 ..< zoneMaxHr
+
+      var zones = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+      var minHr = Double.greatestFiniteMagnitude
+      var maxHr = Double.leastNormalMagnitude
+      var averageHr = 0.0
+
+      durations.withUnsafeBufferPointer { durations in
+        values.withUnsafeBufferPointer { values in
+          for i in 0 ..< durations.count {
+            let value = values[i]
+            minHr = min(minHr, value)
+            maxHr = max(maxHr, value)
+            averageHr += value
+
+            switch value {
+            case zone1Range:
+              zones.0 += durations[i]
+            case zone2Range:
+              zones.1 += durations[i]
+            case zone3Range:
+              zones.2 += durations[i]
+            case zone4Range:
+              zones.3 += durations[i]
+            case zone5Range:
+              zones.4 += durations[i]
+            case zone6Range:
+              zones.5 += durations[i]
+            default:
+              continue
+            }
+          }
+        }
+      }
+
+      averageHr = averageHr / Double(durations.count)
+
+      patch.heartRateMaximum = Int(maxHr)
+      patch.heartRateMinimum = Int(minHr)
+      patch.heartRateMean = Int(averageHr)
+      patch.heartRateZone1 = Int(zones.0)
+      patch.heartRateZone2 = Int(zones.1)
+      patch.heartRateZone3 = Int(zones.2)
+      patch.heartRateZone4 = Int(zones.3)
+      patch.heartRateZone5 = Int(zones.4)
+      patch.heartRateZone6 = Int(zones.5)
+    }
+
+    try await computeStatistics(&patch)
+
+    if options.embedTimeseries {
+      patch.heartRate = try await querySample(
+        healthKitStore: healthKitStore,
+        type: .quantityType(forIdentifier: .heartRate)!,
+        startDate: workout.startDate,
+        endDate: workout.endDate,
+        extraPredicates: predicates.wrapped
+      )
       .compactMap(LocalQuantitySample.init)
-    
-    let respiratoryRate: [LocalQuantitySample] = try await querySample(
-      healthKitStore: healthKitStore,
-      type: .quantityType(forIdentifier: .respiratoryRate)!,
-      startDate: workout.startDate,
-      endDate: workout.endDate
-    )
-      .filter(by: workout.sourceBundle)
+
+      patch.respiratoryRate = try await querySample(
+        healthKitStore: healthKitStore,
+        type: .quantityType(forIdentifier: .respiratoryRate)!,
+        startDate: workout.startDate,
+        endDate: workout.endDate,
+        extraPredicates: predicates.wrapped
+      )
       .compactMap(LocalQuantitySample.init)
-    
-    var copy = workout
-    copy.heartRate = heartRate
-    copy.respiratoryRate = respiratoryRate
-    
-    copies.append(copy)
+    }
+
+    copies.append(patch)
   }
   
   return (.init(workouts: copies), anchors)
 }
-
 
 func handleBloodPressure(
   healthKitStore: HKHealthStore,
@@ -721,10 +870,11 @@ func handleBloodPressure(
 
   let bloodPressureIdentifier = HKCorrelationType.correlationType(forIdentifier: .bloodPressure)!
   
-  let payload = try await query(
+  let payload = try await anchoredQuery(
     healthKitStore: healthKitStore,
     vitalStorage: vitalStorage,
     type: bloodPressureIdentifier,
+    limit: AnchoredQueryChunkSize.timeseries,
     startDate: startDate,
     endDate: endDate
   )
@@ -745,10 +895,11 @@ func handleTimeSeries(
   endDate: Date
 ) async throws -> (samples: [LocalQuantitySample], anchors: [StoredAnchor]) {
   
-  let payload = try await query(
+  let payload = try await anchoredQuery(
     healthKitStore: healthKitStore,
     vitalStorage: vitalStorage,
     type: type,
+    limit: AnchoredQueryChunkSize.timeseries,
     startDate: startDate,
     endDate: endDate
   )
@@ -762,18 +913,21 @@ func handleTimeSeries(
 }
 
 
-private func query(
+private func anchoredQuery(
   healthKitStore: HKHealthStore,
   vitalStorage: VitalHealthKitStorage,
   type: HKSampleType,
-  limit: Int = HKObjectQueryNoLimit,
+  limit: Int,
   startDate: Date? = nil,
   endDate: Date? = nil,
   extraPredicate: NSPredicate? = nil
 ) async throws -> (sample: [HKSample], anchor: StoredAnchor?) {
-  
+
+  let shortID = "Query,\(type.shortenedIdentifier)"
+
   return try await withCheckedThrowingContinuation { continuation in
-    
+    let currentAnchor = vitalStorage.read(key: String(describing: type.self))?.anchor
+
     let handler: AnchorQueryHandler = { (query, samples, deletedObject, newAnchor, error) in
       healthKitStore.stop(query)
       
@@ -788,33 +942,34 @@ private func query(
               vitalAnchors: nil
             )
 
-            VitalLogger.healthKit.info("[AnchoredQuery][\(type.shortenedIdentifier)] no data or no permission; anchor = \(newAnchor?.description ?? "nil")")
+            VitalLogger.healthKit.info("no data or no permission; anchor = \(newAnchor?.description ?? "nil")", source: shortID)
             continuation.resume(with: .success(([], storedAnchor)))
             return
 
           default:
-            VitalLogger.healthKit.info("[AnchoredQuery][\(type.shortenedIdentifier)] HealthKit error = \(error.code)")
+            VitalLogger.healthKit.info("HealthKit error = \(error.code)", source: shortID)
             continuation.resume(with: .failure(error))
             return
           }
         } else {
-          VitalLogger.healthKit.info("[AnchoredQuery][\(type.shortenedIdentifier)] error = \(error)")
+          VitalLogger.healthKit.info("error = \(error)", source: shortID)
           continuation.resume(with: .failure(error))
           return
         }
       }
-      
-      let storedAnchor = StoredAnchor(
+
+      let samples = samples ?? []
+      let anchorToStore = StoredAnchor(
         key: String(describing: type),
         anchor: newAnchor,
         date: Date(),
-        vitalAnchors: nil
+        vitalAnchors: nil,
+        hasMore: !samples.isEmpty && currentAnchor != newAnchor
       )
 
-      let samples = samples ?? []
-      VitalLogger.healthKit.info("[AnchoredQuery][\(type.shortenedIdentifier)] discovered \(samples.count) new samples")
+      VitalLogger.healthKit.info("found \(samples.count) new, \(anchorToStore.hasMore ? "hasMore" : "noMore")", source: shortID)
 
-      continuation.resume(with: .success((samples, storedAnchor)))
+      continuation.resume(with: .success((samples, anchorToStore)))
     }
     
     var predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
@@ -822,26 +977,159 @@ private func query(
     if let extraPredicate = extraPredicate {
       predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [predicate, extraPredicate])
     }
-    
-    let anchor = vitalStorage.read(key: String(describing: type.self))?.anchor
-    
+
     let query = HKAnchoredObjectQuery(
       type: type,
       predicate: predicate,
-      anchor: anchor,
+      anchor: currentAnchor,
       limit: limit,
       resultsHandler: handler
     )
 
-    VitalLogger.healthKit.info("""
-    [AnchoredQuery][\(type.shortenedIdentifier)] requesting delta;
-    bound = \(startDate?.description ?? "nil") ..< \(endDate?.description ?? "nil");
-    anchor = \(anchor?.description ?? "nil")
-    """)
+    VitalLogger.healthKit.info("will look \(startDate?.description ?? "nil") ..< \(endDate?.description ?? "nil")", source: shortID)
+    VitalLogger.healthKit.info("with anchor: \(currentAnchor?.description ?? "nil")", source: shortID)
 
     healthKitStore.execute(query)
   }
 }
+
+@HealthKitActor
+func queryMulti(
+  healthKitStore: HKHealthStore,
+  vitalStorage: VitalHealthKitStorage,
+  types: Set<HKSampleType>,
+  limit: Int = HKObjectQueryNoLimit,
+  startDate: Date? = nil,
+  endDate: Date? = nil,
+  extraPredicates: Predicates = Predicates([])
+) async throws -> [HKSampleType: [HKSample]] {
+  guard #available(iOS 15.0, *) else {
+    return try await withThrowingTaskGroup(of: (key: HKSampleType, samples: [HKSample]).self) { group in
+      for type in types {
+        group.addTask { @HealthKitActor in
+          let samples = try await querySingle(
+            healthKitStore,
+            type: type,
+            limit: limit,
+            startDate: startDate,
+            endDate: endDate,
+            extraPredicates: extraPredicates
+          )
+
+          return (type, samples)
+        }
+      }
+
+      return try await group.reduce(into: [:]) { result, entry in
+        result[entry.key] = entry.samples
+      }
+    }
+  }
+
+  // iOS 15+: Single query to match multiple HKSampleTypes
+
+  return try await withCheckedThrowingContinuation { continuation in
+
+    let handler: (HKSampleQuery, [HKSample]?, Error?) -> Void = { (query, samples, error) in
+      healthKitStore.stop(query)
+
+      if let error = error {
+        if let error = error as? HKError {
+          switch error.code {
+          case .errorAuthorizationNotDetermined, .errorAuthorizationDenied, .errorNoData:
+            VitalLogger.healthKit.info("no data or no permission. \(error)", source: "QueryMulti")
+            continuation.resume(with: .success([:]))
+            return
+
+          default:
+            VitalLogger.healthKit.info("error[\(error.code)] = \(error)", source: "QueryMulti")
+            continuation.resume(with: .failure(error))
+            return
+          }
+        } else {
+          VitalLogger.healthKit.info("error = \(error)", source: "QueryMulti")
+          continuation.resume(with: .failure(error))
+          return
+        }
+      }
+
+      let samples = Dictionary.init(grouping: samples ?? [], by: \.sampleType)
+      continuation.resume(with: .success(samples))
+    }
+
+    var predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
+
+    if !extraPredicates.wrapped.isEmpty {
+      predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [predicate] + extraPredicates.wrapped)
+    }
+
+    let query = HKSampleQuery(
+      queryDescriptors: types.map { type in
+        HKQueryDescriptor(sampleType: type, predicate: predicate)
+      },
+      limit: limit != HKObjectQueryNoLimit ? limit * types.count : HKObjectQueryNoLimit,
+      sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)],
+      resultsHandler: handler
+    )
+
+    healthKitStore.execute(query)
+  }
+}
+
+@HealthKitActor
+private func querySingle(
+  _ healthKitStore: HKHealthStore,
+  type: HKSampleType,
+  limit: Int = HKObjectQueryNoLimit,
+  startDate: Date? = nil,
+  endDate: Date? = nil,
+  extraPredicates: Predicates = Predicates([])
+) async throws -> [HKSample] {
+  return try await withCheckedThrowingContinuation { continuation in
+    let handler: (HKSampleQuery, [HKSample]?, Error?) -> Void = { (query, samples, error) in
+      healthKitStore.stop(query)
+
+      if let error = error {
+        if let error = error as? HKError {
+          switch error.code {
+          case .errorAuthorizationNotDetermined, .errorAuthorizationDenied, .errorNoData:
+            VitalLogger.healthKit.info("no data or no permission for \(type.shortenedIdentifier)", source: "QuerySingle")
+            continuation.resume(with: .success([]))
+            return
+
+          default:
+            VitalLogger.healthKit.info("\(type.shortenedIdentifier) error = \(error.code)", source: "QuerySingle")
+            continuation.resume(with: .failure(error))
+            return
+          }
+        } else {
+          VitalLogger.healthKit.info("\(type.shortenedIdentifier) error = \(error)", source: "QuerySingle")
+          continuation.resume(with: .failure(error))
+          return
+        }
+      }
+
+      continuation.resume(with: .success(samples ?? []))
+    }
+
+    var predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [])
+
+    if !extraPredicates.wrapped.isEmpty {
+      predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [predicate] + extraPredicates.wrapped)
+    }
+
+    let query = HKSampleQuery(
+      sampleType: type,
+      predicate: predicate,
+      limit: limit,
+      sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)],
+      resultsHandler: handler
+    )
+
+    healthKitStore.execute(query)
+  }
+}
+
 
 func calculateIdsForAnchorsPopulation(
   vitalStatistics: [VitalStatistics],
@@ -945,11 +1233,8 @@ func queryActivityDaySummaries(
     ... calendar.floatingDate(of: endTime)
   let queryInterval = calendar.timeRange(of: datesToCompute)
 
-  VitalLogger.healthKit.info("""
-  [Day Summary] lastComputed = \(startTime) now = \(endTime)
-  datesToCompute = \(datesToCompute.lowerBound) ... \(datesToCompute.upperBound)
-  queryInterval = \(queryInterval.lowerBound) ..< \(queryInterval.upperBound)
-  """)
+  VitalLogger.healthKit.info("lastComputed = \(startTime) now = \(endTime)", source: "DaySummary")
+  VitalLogger.healthKit.info("recomputing \(queryInterval.lowerBound) ..< \(queryInterval.upperBound)", source: "DaySummary")
 
   async let _activeEnergyBurnedSum = dependencies.executeStatisticalQuery(
     HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)!,
@@ -1063,6 +1348,7 @@ func querySample(
   startDate: Date? = nil,
   endDate: Date? = nil,
   ascending: Bool = true,
+  extraPredicates: [NSPredicate] = [],
   options: HKQueryOptions = [.strictStartDate]
 ) async throws -> [HKSample] {
   
@@ -1079,12 +1365,16 @@ func querySample(
       continuation.resume(with: .success(samples ?? []))
     }
     
-    let predicate = HKQuery.predicateForSamples(
+    var predicate = HKQuery.predicateForSamples(
       withStart: startDate,
       end: endDate,
       options: options
     )
-    
+
+    if !extraPredicates.isEmpty {
+      predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [predicate] + extraPredicates)
+    }
+
     let sort = [
       NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: ascending)
     ]
@@ -1303,143 +1593,6 @@ func splitPerBundle(_ values: [LocalQuantitySample]) -> [[LocalQuantitySample]] 
   }
   
   return outcome
-}
-
-private func _accumulate(_ values: [LocalQuantitySample], interval: Int, calendar: Calendar) -> [LocalQuantitySample] {
-  let ordered = orderByDate(values)
-  
-  return ordered.reduce(into: []) { newValues, newValue in
-    if let lastValue = newValues.last {
-      
-      let sameHour = calendar.isDate(newValue.startDate, equalTo: lastValue.startDate, toGranularity: .hour)
-      
-      guard sameHour else {
-        newValues.append(newValue)
-        return
-      }
-      
-      let lastValueBucket = Int(calendar.component(.minute, from: lastValue.startDate) / interval)
-      let newValueBucket = Int(calendar.component(.minute, from: newValue.startDate) / interval)
-      
-      guard lastValueBucket == newValueBucket else {
-        newValues.append(newValue)
-        return
-      }
-      
-      var lastValue = newValues.removeLast()
-      lastValue.value = lastValue.value + newValue.value
-      lastValue.endDate = newValue.endDate
-      
-      newValues.append(lastValue)
-      
-    } else {
-      newValues.append(newValue)
-    }
-  }
-}
-
-func accumulate(_ values: [LocalQuantitySample], interval: Int = 15, calendar: Calendar) -> [LocalQuantitySample] {
-  let split = splitPerBundle(values)
-  let outcome = split.flatMap {
-    _accumulate($0, interval: interval, calendar: calendar)
-  }
-  
-  return orderByDate(outcome)
-}
-
-private func _average(_ values: [LocalQuantitySample], calendar: Calendar) -> [LocalQuantitySample] {
-  let ordered = orderByDate(values)
-  
-  guard ordered.count > 2 else {
-    return values
-  }
-  
-  /// We want to preserve these values, instead of averaging them.
-  var min: LocalQuantitySample? = nil
-  var max: LocalQuantitySample? = nil
-  
-  for value in values {
-    if let minValue = min {
-      if value.value <= minValue.value {
-        min = value
-      }
-    } else {
-      min = value
-    }
-    
-    if let maxValue = max {
-      if value.value >= maxValue.value {
-        max = value
-      }
-    } else {
-      max = value
-    }
-  }
-  
-  class Payload {
-    var samples: [LocalQuantitySample] = []
-    var total: Double = 0
-    var totalGrouped: Double = 0
-    var count = 0
-  }
-
-  let payload = Payload()
-  payload.samples.reserveCapacity(ordered.count)
-
-  var outcome: [LocalQuantitySample] = ordered.reduce(into: payload) { payload, newValue in
-    payload.count = payload.count + 1
-    
-    if let lastValue = payload.samples.last {
-      
-      let time = calendar.date(byAdding: .second, value: 5, to: lastValue.startDate)!
-      if time >= newValue.startDate {
-        var lastValue = payload.samples.removeLast()
-        
-        payload.total = payload.total + newValue.value
-        payload.totalGrouped = payload.totalGrouped + 1
-        lastValue.endDate = newValue.endDate
-        
-        if payload.count == ordered.count {
-          lastValue.value = payload.total / payload.totalGrouped
-        }
-        
-        payload.samples.append(lastValue)
-      } else {
-        var lastValue = payload.samples.removeLast()
-        lastValue.value = payload.total / payload.totalGrouped
-        payload.samples.append(lastValue)
-        
-        payload.total = newValue.value
-        payload.totalGrouped = 1
-        
-        payload.samples.append(newValue)
-      }
-      
-    } else {
-      payload.total = newValue.value
-      payload.totalGrouped = payload.totalGrouped + 1
-      payload.samples.append(newValue)
-    }
-  }.samples
-  
-  if let max = max {
-    outcome.append(max)
-  }
-  
-  if let min = min {
-    outcome.append(min)
-  }
-  
-  return outcome
-}
-
-func average(_ values: [LocalQuantitySample], calendar: Calendar) -> [LocalQuantitySample] {
-  let split = splitPerBundle(values)
-  let outcome = split.flatMap {
-    _average($0, calendar: calendar)
-  }
-  
-  return orderByDate(outcome)
 }
 
 func activityPatchGroupedByDay(
